@@ -129,8 +129,8 @@ def process_wikidata(source: Dict):
 				jclaims.P7715[1].mainsnak.datavalue->>'$.value' AS wfo_id,
 				-- P685 NCBI 18%
 				jclaims.P685[1].mainsnak.datavalue->>'$.value' AS ncbi_id,
-				-- P846 GBIF 90%, highest coverage of any cross-ID
-				CAST(jclaims.P846[1].mainsnak.datavalue->>'$.value' AS UINTEGER) AS gbif_id,
+				-- P846 GBIF 90%, normalize URL-shaped IDs occasionally ending up in Wikidata
+				TRY_CAST(NULLIF(regexp_extract(jclaims.P846[1].mainsnak.datavalue->>'$.value', '\\d+$'), '') AS UINTEGER) AS gbif_id,
 				-- P830 EoL 18%
 				jclaims.P830[1].mainsnak.datavalue->>'$.value' AS eol_id,
 				-- P5037 POWO 63%, strip LSID prefix
