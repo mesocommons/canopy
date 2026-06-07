@@ -174,7 +174,7 @@ def process_bhl(source: dict):
 		db.execute("""CREATE TYPE mention_type_enum AS ENUM ('first_mention', 'first_illustration', 'first_eastern', 'first_eastern_illustration');""")
 
 		# Load the initial tsv files
-		page_tsv = db.read_csv(zip.open('Data/page.txt'), parallel=True,sample_size=50000)
+		page_tsv = db.read_csv(zip.open('Data/page.txt'), parallel=True, sample_size=50000, dtype={'Year': 'VARCHAR'})
 		names_tsv = db.read_csv(zip.open('Data/pagename.txt'), parallel=True)
 		mesologger.info("Opened first BHL files")
 
@@ -191,7 +191,7 @@ def process_bhl(source: dict):
 				-- page type: Text, Illustration, Map etc (17 values)
 				CAST(p.PageTypeName AS page_type_enum) AS type,
 				-- publication year from page.txt, ~5.6M rows after first-mention reduction
-			 	ANY_VALUE(NULLIF(REGEXP_EXTRACT(p.Year, '\\d{{4}}', 0),'')::USMALLINT) AS year
+			 	ANY_VALUE(TRY_CAST(NULLIF(REGEXP_EXTRACT(p.Year, '\\d{{4}}', 0),'') AS USMALLINT)) AS year
 			FROM page_tsv p
 			JOIN names_tsv n ON p.PageID = n.PageID
 			GROUP BY p.ItemID, n.NameConfirmed, p.PageTypeName
@@ -200,11 +200,11 @@ def process_bhl(source: dict):
 		mesologger.info(f"Created base table with {db.execute('SELECT COUNT(*) FROM bhl').fetchone()[0]:,} name mentions from BHL")
 
 		# Backfill missing years from item.txt (page.txt year is often null)
-		item_tsv = db.read_csv(zip.open('Data/item.txt'), parallel=True)
+		item_tsv = db.read_csv(zip.open('Data/item.txt'), parallel=True, dtype={'Year': 'VARCHAR'})
 		db.execute(f"""
 			ALTER TABLE bhl ADD COLUMN title_id UINTEGER;
 			-- item.txt has Year and TitleID for each ItemID
-			UPDATE bhl b SET year = i.Year, title_id = i.TitleID
+			UPDATE bhl b SET year = TRY_CAST(NULLIF(REGEXP_EXTRACT(i.Year, '\\d{{4}}', 0),'') AS USMALLINT), title_id = i.TitleID
 			FROM item_tsv i WHERE b.year IS NULL and i.Year IS NOT NULL AND b.item_id = i.ItemID;
 		""")
 		mesologger.info(f"Added missing years from item.txt")
