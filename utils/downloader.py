@@ -258,9 +258,13 @@ def get_local_source_file(starts_with: str) -> str | None:
 		# Process only files that match expected dataset prefix
 		if file.startswith(starts_with + '.'):
 			# Ignore interrupted download/assembly sidecars so they cannot become canonical sources
-			if file.endswith('.tmp'): continue
-			# Ignore malformed filenames that do not match dataset.timestamp.suffix convention
-			if file.count('.') != 2: continue
+			if file.endswith('.tmp') or file.endswith('.aria2'): continue
+			# Split source filename while allowing multi-dot suffixes like .sql.gz
+			parts = file.split('.')
+			# Ignore malformed filenames that lack dataset.timestamp.suffix shape
+			if len(parts) < 3: continue
+			# Ignore files where the timestamp segment is not a numeric datehash
+			if not parts[1].isdigit(): continue
 			# Skip zero-byte cleanup for S3-backed listings
 			if storage.is_s3() and storage.size(file_path) == 0: continue
 			# Process local zero-byte cleanup when using filesystem backend
