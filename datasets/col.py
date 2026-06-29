@@ -72,7 +72,14 @@ def process_col(source: dict):
 		# Materialize distribution as temp table — queried multiple times across habitat strategies
 		db.execute("CREATE TEMP TABLE col_distribution AS SELECT * FROM distribution_tsv")
 		# reference.json only — read_csv chokes on the nested JSON structure
-		reference_json = db.read_json(zip.open('reference.json'),ignore_errors=True)
+		# Pin sparse fields so DuckDB sampling cannot drop optional keys like DOI
+		reference_json = db.read_json(zip.open('reference.json'),ignore_errors=True, columns={
+			'id': 'VARCHAR',
+			'issued': 'STRUCT("date-parts" BIGINT[][], literal VARCHAR)',
+			'title': 'VARCHAR',
+			'container-title': 'VARCHAR',
+			'DOI': 'VARCHAR',
+		})
 		mesologger.info(f"""{source['name']} archive unzipped""")
 		db.execute(f"""
 			CREATE TABLE col AS SELECT
