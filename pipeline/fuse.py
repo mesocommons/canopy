@@ -695,23 +695,31 @@ def reduce_vernacular(results: dict, db: duckdb.DuckDBPyConnection):
 		WHERE len(names) > 1;
 	""")
 	if settings.VERBOSE: db.sql("SELECT * FROM merged_vernacular WHERE process;").show()
+	# Order each multiset by usage so its seed deterministically represents its nearest variants
+	db.execute("""UPDATE merged_vernacular SET names = flatten(
+		list_transform(
+			list_sort(list_transform(list_distinct(names), x -> {'c': -len(list_filter(names, y -> y = x)), 'n': x})),
+			s -> list_transform(range(len(list_filter(names, y -> y = s.n))), i -> s.n)
+		)
+	) WHERE process;""")
+	# Count rows that need their first similarity bucket
 	remaining = db.execute("SELECT COUNT(*) FROM merged_vernacular WHERE process").fetchone()[0]
 	mesologger.info(f"Starting Levenshtein process for {remaining:,} rows...")
 	while True:
 		# Extract: Find any names that are Levenshtein distance < 3 from the first item in the (remaining) source list
 		mesologger.info(f"(lev:bucket) {remaining:,} rows left to process               ", extra={'sameline': True})
 		db.execute("""UPDATE merged_vernacular SET 
-			-- Put our first value and all similar names in a bucket
-			bucket = list_distinct([names[1]] || list_filter(names, x -> levenshtein(names[1],x) < 3)) WHERE process;""")
-		# Also set the most common value
+			-- Keep every source occurrence so the representative reflects actual usage
+			bucket = list_filter(names, x -> levenshtein(names[1],x) < 3) WHERE process;""")
+		# Keep the frequency-ranked seed as the representative for its similarity bucket
 		mesologger.info(f"(lev:common) {remaining:,} rows left to process               ", extra={'sameline': True})
-		db.execute("""UPDATE merged_vernacular SET most_common = list_mode(bucket) WHERE process;""")
+		db.execute("""UPDATE merged_vernacular SET most_common = names[1] WHERE process;""")
 		# Replace: Replace their occurrence in the target list with the most common spelling variant
 		mesologger.info(f"(lev:transf) {remaining:,} rows left to process               ", extra={'sameline': True})
 		db.execute("""UPDATE merged_vernacular SET 
 			names = list_filter(names, x -> NOT list_contains(bucket, x)),
 			-- Faster if we only do it for operations where we actually need to replace multiple names with common_name 
-			target = CASE WHEN len(bucket) > 1 THEN list_transform(target, x -> CASE WHEN list_contains(bucket, x) THEN most_common ELSE x END)
+			target = CASE WHEN len(list_distinct(bucket)) > 1 THEN list_transform(target, x -> CASE WHEN list_contains(bucket, x) THEN most_common ELSE x END)
 					 ELSE target 
 					 END
 			WHERE process 
@@ -745,8 +753,8 @@ def reduce_vernacular(results: dict, db: duckdb.DuckDBPyConnection):
 	# Register UDF
 	vernacular_struct = duckdb.struct_type({"lang": duckdb.sqltype("VARCHAR"),"names": duckdb.list_type(duckdb.sqltype("VARCHAR"))})
 	db.create_function('vernacular_udf', vernacular_udf, [vernacular_struct], 'VARCHAR[]', type='arrow')
-	# Process long name arrays in polars
-	db.execute(f"""UPDATE merged_vernacular SET names = vernacular_udf(struct_pack(lang := lang, names := names)) WHERE len(names) > 1""")	
+	# Sort ties alphabetically before Polars ranks names by their occurrence counts
+	db.execute(f"""UPDATE merged_vernacular SET names = vernacular_udf(struct_pack(lang := lang, names := list_sort(names))) WHERE len(names) > 1""")
 	mesologger.info(f"Vernacular name processing complete")
 	if settings.VERBOSE: db.sql("SELECT * FROM merged_vernacular WHERE len(names) > 1 ORDER BY id_meso DESC").show()
 	# Add processed names back to main table
@@ -759,7 +767,7 @@ def reduce_vernacular(results: dict, db: duckdb.DuckDBPyConnection):
 			SELECT 
 				id_meso, 
 				-- Limit sorted lists to 10 entries
-				MAP_FROM_ENTRIES(ARRAY_AGG(ROW(lang, names[1:10]))) AS vernacular_map
+				MAP_FROM_ENTRIES(ARRAY_AGG(ROW(lang, names[1:10]) ORDER BY lang)) AS vernacular_map
 			FROM merged_vernacular
 			GROUP BY id_meso
 		) mv
