@@ -87,7 +87,8 @@ def process_wikidata(source: Dict):
 		db.execute(f"""
 			CREATE TEMPORARY TABLE wikidata_parsed AS SELECT
 				id, claims AS jclaims, labels AS jlabels, aliases AS jaliases, sitelinks AS jsitelinks
-			FROM read_json('{ os.path.join(TMP_DIR,filtered)}', format='newline_delimited', ignore_errors=True, maximum_depth=6, map_inference_threshold=100)
+			-- Require entity objects to unpack into the root fields consumed below
+			FROM read_json('{ os.path.join(TMP_DIR,filtered)}', format='newline_delimited', records=true, ignore_errors=True, maximum_depth=6, map_inference_threshold=100)
 			-- Only Q-entities (skip P-property definitions that slip through the filter)
 			WHERE starts_with(id, 'Q')
 			{ 'LIMIT ' + str(settings.BACKBONE_LOOPS) if settings.BACKBONE_LOOPS > 0 else '' };
