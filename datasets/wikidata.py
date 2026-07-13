@@ -84,13 +84,21 @@ def process_wikidata(source: Dict):
 			SET preserve_insertion_order = false;
 			SET enable_progress_bar = false;
 		""")
-		# Parse filtered NDJSON into lookup table - keeps claims, labels, aliases, sitelinks as JSON
+		# Parse filtered NDJSON with stable container types independent of chunk completion order
 		db.execute(f"""
-			CREATE TEMPORARY TABLE wikidata_parsed AS SELECT
-				id, claims AS jclaims, labels AS jlabels, aliases AS jaliases, sitelinks AS jsitelinks
-			-- Require entity objects to unpack into the root fields consumed below
-			-- Keep variable language-key dictionaries as MAPs; 50 is safely below the sampled 97 label keys without broadly converting fixed objects
-			FROM read_json('{ os.path.join(TMP_DIR,filtered)}', format='newline_delimited', records=true, ignore_errors=True, maximum_depth=6, map_inference_threshold=50)
+			CREATE TEMPORARY TABLE wikidata_parsed AS SELECT id, claims AS jclaims, labels AS jlabels, aliases AS jaliases, sitelinks AS jsitelinks
+			-- Keep dynamic property IDs as MAP keys while retaining heterogeneous claim bodies as JSON
+			FROM read_json('{ os.path.join(TMP_DIR,filtered)}', format='newline_delimited', records=true, ignore_errors=True, columns={{
+				id: 'VARCHAR',
+				-- Property-keyed statements containing identifiers, taxonomy, traits, and qualifiers
+				claims: 'MAP(VARCHAR, JSON[])',
+				-- Language-keyed primary display names
+				labels: 'MAP(VARCHAR, STRUCT(language VARCHAR, value VARCHAR))',
+				-- Language-keyed alternative names with multiple values per language
+				aliases: 'MAP(VARCHAR, STRUCT(language VARCHAR, value VARCHAR)[])',
+				-- Wiki-project-keyed page titles and badges
+				sitelinks: 'MAP(VARCHAR, STRUCT(site VARCHAR, title VARCHAR, badges VARCHAR[]))'
+			}})
 			-- Only Q-entities (skip P-property definitions that slip through the filter)
 			WHERE starts_with(id, 'Q')
 			{ 'LIMIT ' + str(settings.BACKBONE_LOOPS) if settings.BACKBONE_LOOPS > 0 else '' };
