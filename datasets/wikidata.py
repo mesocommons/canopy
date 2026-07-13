@@ -16,7 +16,8 @@ import duckdb
 # File downloads & imports
 from .. import settings, TMP_DIR
 from ..utils.queries import build_rank_and_status, strip_rank_from_name, find_hybrids, name_cleanup, validate, write_to_disc, language_mappings
-from ..utils.filehandlers import fetch, filter_gzip, get_system_resources
+from ..utils.filehandlers import fetch
+from ..utils import gzipfilter
 from ..utils.downloader import aria_ready
 
 # Configuration
@@ -72,14 +73,14 @@ async def update_wikidata(session):
 def process_wikidata(source: Dict):
 	filtered = f"{os.path.splitext(source['latest_download'])[0]}.filtered"
 	# Reuse existing filtered file if available, otherwise ripgrep the full dump
-	if not os.path.isfile(os.path.join(TMP_DIR,filtered)): filtered = filter_gzip(source, "|".join([f'"{prop}"' for prop in RIPGREP_FILTERS]))
+	if not os.path.isfile(os.path.join(TMP_DIR,filtered)): filtered = gzipfilter.filter(source, "|".join([f'"{prop}"' for prop in RIPGREP_FILTERS]))
 	# Process with DuckDB
 	with duckdb.connect(':memory:') as db:
 		# Route DuckDB spill files to canopy temp directory
 		db.execute(f"SET temp_directory = '{TMP_DIR}'")
-		# Update settings
+		# Reserve one core while DuckDB transforms the filtered Wikidata records
 		db.execute(f"""
-			SET threads = { int(get_system_resources()[0] - 1) };
+			SET threads = { max(1, (os.cpu_count() or 2) - 1) };
 			SET preserve_insertion_order = false;
 			SET enable_progress_bar = false;
 		""")
