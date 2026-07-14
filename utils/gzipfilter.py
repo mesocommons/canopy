@@ -20,6 +20,34 @@ def resources() -> list[int, int]:
         mesologger.warning(f"Unable to detect system cores and RAM, using 8GB and 8 threads {e}")
         return [8,8]
 
+# Convert filtered JSON-array records into valid NDJSON without parsing their contents
+def normalize(file: str):
+	# Keep the original filtered artifact intact until the complete normalized replacement is ready
+	cleaned = f"{file}.cleaning"
+	# Refuse to overwrite residue that may contain evidence from an interrupted normalization
+	if os.path.exists(cleaned): raise RuntimeError(f"Normalization output already exists {cleaned}")
+	# Stream normalized records into a separate file so failures cannot corrupt the filtered input
+	with open(cleaned, "wb") as output:
+		# Remove only commas at physical line endings while passing every other line through unchanged
+		result = subprocess.run(
+			["rg", ",$", "--replace", "", "--passthru", "--no-line-number", "--no-filename", "--binary", "--mmap", file],
+			stdout=output,
+			stderr=subprocess.PIPE,
+		)
+	# Accept ripgrep's no-match status because already-normalized files are valid passthrough inputs
+	if result.returncode not in [0, 1]:
+		# Preserve the temporary output for diagnosis while surfacing ripgrep's exact failure
+		error = result.stderr.decode("utf-8", errors="replace")
+		raise RuntimeError(f"Unable to normalize {file}: ripgrep exited {result.returncode}: {error}")
+	# Reject an empty replacement so a filtering or passthrough failure cannot erase useful input
+	if os.path.getsize(cleaned) == 0: raise RuntimeError(f"Normalization produced an empty file {cleaned}")
+	# Atomically expose valid NDJSON at the existing filtered artifact path
+	os.replace(cleaned, file)
+	# Log completion without introducing another persistent pipeline artifact
+	mesologger.info(f"Normalized trailing JSON array separators in {os.path.basename(file)}")
+	# Return the unchanged artifact path for compact caller flow
+	return file
+
 # Takes a gzipped file and filter criteria, splits the gzip in chunks, 
 # runs them through ripgrep and produces one output file in temp dir
 def filter(source: dict, pattern: str):
@@ -49,9 +77,13 @@ def filter(source: dict, pattern: str):
 						os.remove(chunk)
 					except Exception as e: mesologger.error(f"Error processing {chunk}: {e}")
 		mesologger.info(f"All { len(result_files) } chunks merged into { filtered_filename }")
+		# Convert copied JSON-array entries into valid newline-delimited JSON before DuckDB reads them
+		normalize(os.path.join(TMP_DIR, filtered_filename))
 		return filtered_filename
 	except Exception as e:
 		mesologger.error(f"Error {e}")
+		# Abort processing rather than returning a missing or partially normalized artifact
+		raise
 	
 # Split and scan gzipped file for gzip headers
 def chunks(file):
