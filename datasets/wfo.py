@@ -55,12 +55,20 @@ def process_wfo(source: dict):
 		reference_csv = db.read_csv(zip.open('references.csv'),parallel=True)
 		mesologger.info(f"Extracted contents of WFO archive zip")
 		# Create merged table by selecting all fields we're interested and create placeholders for further data
+		# Store incoming accepted-name references as backlinks so fuse can prefer WFO concepts used by the active graph
 		db.execute(f"""
 			CREATE TABLE wfo AS 
 			-- Extract BHL title IDs from references.csv relation URLs, <1% populated
 			WITH bhl_refs AS (
 				SELECT taxonID, CAST(NULLIF(REGEXP_EXTRACT(lower(relation), 'bhl\\.title\\.(\\d+)', 1),'') AS UINTEGER) AS bhl_title
 				FROM reference_csv WHERE lower(relation) LIKE '%/bhl.title.%'
+			),
+			-- Count active WFO rows that identify each candidate as their accepted concept
+			accepted_backlinks AS (
+				SELECT acceptedNameUsageID AS taxonID, COUNT(*)::UINTEGER AS backlinks
+				FROM taxa_csv
+				WHERE acceptedNameUsageID IS NOT NULL AND doNotProcess_reason IS NULL
+				GROUP BY acceptedNameUsageID
 			)
 			SELECT 
 				-- classification.csv taxonID (wfo-NNNN), ~1.7M rows after doNotProcess filter
@@ -80,6 +88,8 @@ def process_wfo(source: dict):
 				trim(t.scientificNameAuthorship) as author_raw,
 				-- Synonym ~1M, Accepted ~450k, Unchecked ~220k
 			 	t.taxonomicStatus AS status_raw,
+				-- incoming accepted-name references distinguish active concepts from orphaned duplicate WFO rows
+				COALESCE(ab.backlinks, 0) AS backlinks,
 				-- scientificNameID holds IPNI LSIDs or Tropicos numeric IDs, parsed in wfo_external_ids
 			 	t.scientificNameID AS links_raw,
 				-- year from namePublishedIn parenthesized pattern, 71% populated
@@ -91,6 +101,7 @@ def process_wfo(source: dict):
 				CAST(t.tropicosId AS UINTEGER) AS tropicos_id
 			FROM taxa_csv t
 			LEFT JOIN bhl_refs r ON t.taxonID = r.taxonID
+			LEFT JOIN accepted_backlinks ab ON t.taxonID = ab.taxonID
 			-- doNotProcess rows are duplicates or junk non-alphanumeric names
 			WHERE t.doNotProcess_reason IS NULL;
 		""")

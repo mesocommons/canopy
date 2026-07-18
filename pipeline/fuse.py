@@ -255,10 +255,25 @@ def initial_backbone(results: dict, db: duckdb.DuckDBPyConnection):
 	mesologger.info(f"""Added {db.execute("SELECT COUNT(*) FROM meso WHERE source = 'wfo'").fetchone()[0]:,} plant names from WFO""")	
 	# Also add WFO IDs to existing WCVP rows
 	db.execute("""
-		WITH wfo_lookup AS (SELECT DISTINCT id_raw, ipni_id, tropicos_id FROM wfo WHERE ipni_id IS NOT NULL)
-		UPDATE meso m SET 
-			wfo_id = w.id_raw,
-			tropicos_id = w.tropicos_id
+		WITH wfo_candidates AS (
+			-- Score exact agreement with the IPNI nomenclatural row
+			SELECT w.*, CASE WHEN EXISTS (SELECT 1 FROM ipni i WHERE i.id_raw = w.ipni_id AND i.name_clean = w.name_clean) THEN 1 ELSE 0 END
+				-- Add agreement with the POWO treatment
+				+ CASE WHEN EXISTS (SELECT 1 FROM powo p WHERE p.id_raw = w.ipni_id AND p.name_clean = w.name_clean) THEN 1 ELSE 0 END
+				-- Add agreement with the linked WCVP treatment
+				+ CASE WHEN EXISTS (SELECT 1 FROM wcvp v WHERE v.powo_id = w.ipni_id AND v.name_clean = w.name_clean) THEN 1 ELSE 0 END AS name_support
+			-- Restrict scoring to WFO rows eligible for the IPNI backfill
+			FROM wfo w WHERE w.ipni_id IS NOT NULL
+		),
+		wfo_lookup AS (
+			-- Reduce duplicate IPNI mappings to one active WFO concept before UPDATE FROM
+			SELECT DISTINCT ON (ipni_id) id_raw, ipni_id, tropicos_id FROM wfo_candidates
+			-- Prefer WFO status and graph evidence before cross-source agreement and stable ID
+			ORDER BY ipni_id, CASE status_clean WHEN 'accepted' THEN 0 WHEN 'synonym' THEN 1 ELSE 2 END, backlinks DESC, name_support DESC, id_raw
+		)
+		-- Attach the selected WFO concept and its compatible Tropicos link
+		UPDATE meso m SET wfo_id = w.id_raw, tropicos_id = w.tropicos_id
+		-- Update only unlinked plant backbone rows carrying the shared IPNI identifier
 		FROM wfo_lookup w WHERE m.wfo_id IS NULL AND m.source NOT IN ('wfo','fungorum') AND m.ipni_id = w.ipni_id;
 	""")
 	mesologger.info(f"Added WFO IDs to existing IPNI/WCVP/POWO rows")
