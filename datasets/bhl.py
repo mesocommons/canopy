@@ -15,6 +15,8 @@ from .. import SRC_DIR, TMP_DIR, settings
 
 # File handling
 import gzip, os, ssl, zipfile
+# Resolve the wall-clock UTC year for rejecting impossible future publication dates
+from datetime import datetime, timezone
 import aiohttp
 from ..utils.filehandlers import get_file
 # Load run-state helper to persist latest manual BHL download/process metadata
@@ -31,6 +33,8 @@ from ..utils.queries import name_cleanup, find_hybrids, validate, write_to_disc
 BHL_S3 = "https://s3.us-east-2.amazonaws.com/bhl-open-data/data"
 # Files we need from the S3 bucket
 BHL_FILES = ['page.txt', 'pagename.txt', 'item.txt', 'title.txt', 'creator.txt']
+# Require title-range corroboration or correction for dates before early modern publishing
+BHL_YEAR_FLOOR = 1600
 
 source = {
     "name": "bhl",
@@ -156,6 +160,8 @@ def process_bhl(source: dict):
 	with zipfile.ZipFile(source_path, 'r') as zip, duckdb.connect(':memory:') as db:
 		# Almost guarantueed to need a temp dir:
 		db.execute(f"SET temp_directory = '{ TMP_DIR }'")
+		# Resolve the hard upper bound at run time so future-year rows cannot enter history
+		current_year = datetime.now(timezone.utc).year
 
 		# Create the enum types
 		db.execute("""
@@ -179,7 +185,7 @@ def process_bhl(source: dict):
 		mesologger.info("Opened BHL page and name files")
 		# Load compact item and title metadata before the large name join so effective years and language buckets are available during reduction
 		item_tsv = db.read_csv(zip.open('Data/item.txt'), parallel=True, dtype={'ItemID': 'UINTEGER', 'TitleID': 'UINTEGER', 'Year': 'VARCHAR'})
-		titles_tsv = db.read_csv(zip.open('Data/title.txt'), parallel=True, dtype={'TitleID': 'UINTEGER', 'LanguageCode': 'VARCHAR'})
+		titles_tsv = db.read_csv(zip.open('Data/title.txt'), parallel=True, dtype={'TitleID': 'UINTEGER', 'LanguageCode': 'VARCHAR', 'StartYear': 'VARCHAR', 'EndYear': 'VARCHAR'})
 		# Materialize distinct item rows because BHL links 9k items to multiple bibliography titles
 		db.execute("""
 			CREATE TEMP TABLE item_rows AS
@@ -189,13 +195,23 @@ def process_bhl(source: dict):
 				TRY_CAST(NULLIF(REGEXP_EXTRACT(Year, '\\d{4}', 0), '') AS USMALLINT) AS item_year
 			FROM item_tsv;
 		""")
-		# Materialize one language classification per title so item joins cannot multiply page candidates
+		# Materialize one language and publication-range context per title so item joins stay one-to-one
 		db.execute("""
 			CREATE TEMP TABLE title_languages AS
-			SELECT DISTINCT
-				CAST(TitleID AS UINTEGER) AS title_id,
-				COALESCE(LanguageCode IN ('CHI', 'JPN', 'ARA', 'HEB', 'OTA', 'URD', 'PER', 'SAN', 'GUJ', 'HIN', 'IND'), FALSE) AS eastern
-			FROM titles_tsv;
+			WITH parsed AS (
+				SELECT DISTINCT
+					CAST(TitleID AS UINTEGER) AS title_id,
+					COALESCE(LanguageCode IN ('CHI', 'JPN', 'ARA', 'HEB', 'OTA', 'URD', 'PER', 'SAN', 'GUJ', 'HIN', 'IND'), FALSE) AS eastern,
+					TRY_CAST(NULLIF(REGEXP_EXTRACT(StartYear, '\\d{4}', 0), '') AS INTEGER) AS start_year,
+					TRY_CAST(NULLIF(REGEXP_EXTRACT(EndYear, '\\d{4}', 0), '') AS INTEGER) AS end_year
+				FROM titles_tsv
+			)
+			SELECT
+				title_id,
+				eastern,
+				CASE WHEN start_year IS NULL THEN end_year WHEN end_year IS NULL THEN start_year ELSE least(start_year, end_year) END AS range_start,
+				CASE WHEN end_year IS NULL THEN start_year WHEN start_year IS NULL THEN end_year ELSE greatest(start_year, end_year) END AS range_end
+			FROM parsed;
 		""")
 		# Reject conflicting fallback years because choosing one arbitrarily could change event chronology
 		year_conflicts = db.execute("SELECT count() FROM (SELECT item_id FROM item_rows GROUP BY item_id HAVING count(DISTINCT struct_pack(present := item_year IS NOT NULL, year := item_year)) > 1)").fetchone()[0]
@@ -222,10 +238,10 @@ def process_bhl(source: dict):
 			FROM item_rows
 			GROUP BY item_id;
 		""")
-		# Build the one-row-per-item context used by page candidates
+		# Build the one-row-per-item context used by page candidates and year reconciliation
 		db.execute("""
 			CREATE TEMP TABLE item_context AS
-			SELECT i.item_id, i.item.title_id AS title_id, i.item.item_year AS item_year, COALESCE(t.eastern, FALSE) AS eastern
+			SELECT i.item_id, i.item.title_id AS title_id, i.item.item_year AS item_year, COALESCE(t.eastern, FALSE) AS eastern, t.range_start, t.range_end
 			FROM item_winners i
 			LEFT JOIN title_languages t ON t.title_id = i.item.title_id;
 		""")
@@ -255,19 +271,41 @@ def process_bhl(source: dict):
 			{ 'LIMIT ' + str(settings.BACKBONE_LOOPS) if settings.BACKBONE_LOOPS > 0 else '' };
 		""")
 		mesologger.info(f"Reduced BHL page classifications to {db.execute('SELECT count() FROM page_records').fetchone()[0]:,} unique pages")
-		# Assign dated candidates to chronological buckets and duplicate illustrations into one bounded quality-proxy pool
-		db.execute("""
+		# Reconcile page/item years before assigning chronology buckets and bounded popular candidates
+		db.execute(f"""
 			CREATE TEMP TABLE raw_winners AS
-			WITH page_candidates AS (
+			WITH page_evidence AS (
 				SELECT
 					p.id_raw,
 					p.page.item_id AS item_id,
 					p.page.page_type AS page_type,
-					COALESCE(p.page.page_year, i.item_year) AS effective_year,
+					p.page.page_year AS page_year,
+					i.item_year,
 					i.title_id,
-					COALESCE(i.eastern, FALSE) AS eastern
+					COALESCE(i.eastern, FALSE) AS eastern,
+					i.range_start,
+					i.range_end,
+					CASE WHEN p.page.page_year IS NULL OR i.range_start IS NULL THEN NULL ELSE i.range_start + ((p.page.page_year % 100 - i.range_start % 100 + 100) % 100) END AS page_century,
+					CASE WHEN i.item_year IS NULL OR i.range_start IS NULL THEN NULL ELSE i.range_start + ((i.item_year % 100 - i.range_start % 100 + 100) % 100) END AS item_century
 				FROM page_records p
 				LEFT JOIN item_context i ON i.item_id = p.page.item_id
+			), page_candidates AS (
+				SELECT
+					id_raw,
+					item_id,
+					page_type,
+					CAST(CASE
+						WHEN page_year BETWEEN {BHL_YEAR_FLOOR} AND {current_year} THEN page_year
+						WHEN page_year <= {current_year} AND page_year BETWEEN range_start AND range_end THEN page_year
+						WHEN item_year <= {current_year} AND item_year BETWEEN range_start AND range_end THEN item_year
+						WHEN page_century <= {current_year} AND page_century BETWEEN range_start AND range_end AND page_century + 100 > range_end THEN page_century
+						WHEN item_century <= {current_year} AND item_century BETWEEN range_start AND range_end AND item_century + 100 > range_end THEN item_century
+						WHEN item_year BETWEEN {BHL_YEAR_FLOOR} AND {current_year} THEN item_year
+						ELSE NULL
+					END AS USMALLINT) AS effective_year,
+					title_id,
+					eastern
+				FROM page_evidence
 			), categorized_base AS (
 				SELECT
 					n.NameConfirmed AS name_raw,

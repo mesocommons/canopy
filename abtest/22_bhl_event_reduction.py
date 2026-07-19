@@ -9,6 +9,8 @@
 # The default run keeps one deterministic page-ID partition so query shape can be tested
 # safely. Pass --full only after the sampled path has validated cardinality and runtime.
 import argparse
+# Resolve the wall-clock UTC year for hard upper-bound validation.
+from datetime import datetime, timezone
 # Locate versioned source and baseline files without hard-coding release dates.
 import glob
 # Build cross-platform paths and create the dedicated spill directory.
@@ -40,6 +42,10 @@ BASELINE = sorted(glob.glob(os.path.join(BASE_DIR, 'data', 'processed', 'bhl.*.p
 TMP_DIR = os.path.join(BASE_DIR, 'data', 'temp', 'bhl-event-abtest')
 # Preserve the current Eastern-language proxy exactly.
 EASTERN_LANGUAGES = "('CHI', 'JPN', 'ARA', 'HEB', 'OTA', 'URD', 'PER', 'SAN', 'GUJ', 'HIN', 'IND')"
+# Require title-range corroboration for older chronology candidates.
+YEAR_FLOOR = 1600
+# Apply the requested hard wall-clock upper bound.
+CURRENT_YEAR = datetime.now(timezone.utc).year
 # Keep representative names visible in every report.
 SENTINELS = ['quercus alba', 'amanita muscaria', 'salix alba', 'arabidopsis thaliana', 'arabis thaliana']
 # Name the working table like production so shared cleanup helpers can operate unchanged.
@@ -206,7 +212,7 @@ def register_sources(db, archive):
 	title_tsv = db.read_csv(
 		archive.open('Data/title.txt'),
 		parallel=True,
-		dtype={'TitleID': 'UINTEGER', 'LanguageCode': 'VARCHAR', 'ShortTitle': 'VARCHAR', 'FullTitle': 'VARCHAR'},
+		dtype={'TitleID': 'UINTEGER', 'LanguageCode': 'VARCHAR', 'StartYear': 'VARCHAR', 'EndYear': 'VARCHAR', 'ShortTitle': 'VARCHAR', 'FullTitle': 'VARCHAR'},
 	)
 	# Read title creators only after the heavy event reduction needs final enrichment.
 	creator_tsv = db.read_csv(
@@ -240,13 +246,23 @@ def build_context_lookups(db):
 			TRY_CAST(NULLIF(REGEXP_EXTRACT(Year, '\\d{4}', 0), '') AS USMALLINT) AS item_year
 		FROM item_tsv;
 	""")
-	# Materialize distinct language classifications so title joins also remain one-to-one.
+	# Materialize distinct language and publication-range context so title joins remain one-to-one.
 	db.execute(f"""
 		CREATE TEMP TABLE title_languages AS
-		SELECT DISTINCT
-			CAST(TitleID AS UINTEGER) AS title_id,
-			COALESCE(LanguageCode IN {EASTERN_LANGUAGES}, FALSE) AS eastern
-		FROM title_tsv;
+		WITH parsed AS (
+			SELECT DISTINCT
+				CAST(TitleID AS UINTEGER) AS title_id,
+				COALESCE(LanguageCode IN {EASTERN_LANGUAGES}, FALSE) AS eastern,
+				TRY_CAST(NULLIF(REGEXP_EXTRACT(StartYear, '\\d{{4}}', 0), '') AS INTEGER) AS start_year,
+				TRY_CAST(NULLIF(REGEXP_EXTRACT(EndYear, '\\d{{4}}', 0), '') AS INTEGER) AS end_year
+			FROM title_tsv
+		)
+		SELECT
+			title_id,
+			eastern,
+			CASE WHEN start_year IS NULL THEN end_year WHEN end_year IS NULL THEN start_year ELSE least(start_year, end_year) END AS range_start,
+			CASE WHEN end_year IS NULL THEN start_year WHEN start_year IS NULL THEN end_year ELSE greatest(start_year, end_year) END AS range_end
+		FROM parsed;
 	""")
 	# Count item IDs linked to multiple title records before reducing that known BHL shape.
 	multi_title_items = db.execute("SELECT count() FROM (SELECT item_id FROM item_rows GROUP BY item_id HAVING count() > 1)").fetchone()[0]
@@ -285,10 +301,10 @@ def build_context_lookups(db):
 		FROM item_rows
 		GROUP BY item_id;
 	""")
-	# Join the one-row-per-item winner to one-row-per-title language metadata.
+	# Join the one-row-per-item winner to one-row-per-title language and date-range metadata.
 	db.execute("""
 		CREATE TEMP TABLE item_context AS
-		SELECT i.item_id, i.item.title_id AS title_id, i.item.item_year AS item_year, COALESCE(t.eastern, FALSE) AS eastern
+		SELECT i.item_id, i.item.title_id AS title_id, i.item.item_year AS item_year, COALESCE(t.eastern, FALSE) AS eastern, t.range_start, t.range_end
 		FROM item_winners i
 		LEFT JOIN title_languages t ON t.title_id = i.item.title_id;
 	""")
@@ -340,18 +356,40 @@ def build_raw_winners(db):
 	# Start the heavy association scan timer.
 	start = time.perf_counter()
 	# Aggregate directly from the unique page relation so no 112-million-row intermediate is written.
-	db.execute("""
+	db.execute(f"""
 		CREATE TEMP TABLE raw_winners AS
-		WITH page_candidates AS (
+		WITH page_evidence AS (
 			SELECT
 				p.id_raw,
 				p.page.item_id AS item_id,
 				p.page.page_type AS page_type,
-				COALESCE(p.page.page_year, i.item_year) AS effective_year,
+				p.page.page_year AS page_year,
+				i.item_year,
 				i.title_id,
-				COALESCE(i.eastern, FALSE) AS eastern
+				COALESCE(i.eastern, FALSE) AS eastern,
+				i.range_start,
+				i.range_end,
+				CASE WHEN p.page.page_year IS NULL OR i.range_start IS NULL THEN NULL ELSE i.range_start + ((p.page.page_year % 100 - i.range_start % 100 + 100) % 100) END AS page_century,
+				CASE WHEN i.item_year IS NULL OR i.range_start IS NULL THEN NULL ELSE i.range_start + ((i.item_year % 100 - i.range_start % 100 + 100) % 100) END AS item_century
 			FROM page_records p
 			LEFT JOIN item_context i ON i.item_id = p.page.item_id
+		), page_candidates AS (
+			SELECT
+				id_raw,
+				item_id,
+				page_type,
+				CAST(CASE
+					WHEN page_year BETWEEN {YEAR_FLOOR} AND {CURRENT_YEAR} THEN page_year
+					WHEN page_year <= {CURRENT_YEAR} AND page_year BETWEEN range_start AND range_end THEN page_year
+					WHEN item_year <= {CURRENT_YEAR} AND item_year BETWEEN range_start AND range_end THEN item_year
+					WHEN page_century <= {CURRENT_YEAR} AND page_century BETWEEN range_start AND range_end AND page_century + 100 > range_end THEN page_century
+					WHEN item_century <= {CURRENT_YEAR} AND item_century BETWEEN range_start AND range_end AND item_century + 100 > range_end THEN item_century
+					WHEN item_year BETWEEN {YEAR_FLOOR} AND {CURRENT_YEAR} THEN item_year
+					ELSE NULL
+				END AS USMALLINT) AS effective_year,
+				title_id,
+				eastern
+			FROM page_evidence
 		), categorized_base AS (
 			SELECT
 				n.NameConfirmed AS name_raw,
