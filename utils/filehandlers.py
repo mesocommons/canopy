@@ -28,34 +28,38 @@ async def fetch(session, source: dict) -> bool:
 		source['download_updated'] = bool(await pull(session, source))
 		# Log successful source refresh for checkpoint gating visibility
 		if source['download_updated']: mesologger.info(f"Successfully fetched new remote version of { source['name'] }.")
-	# Ensure source processing path is available locally for downstream zip/gzip consumers
-	if source.get('latest_download'):
-		# Build canonical source path under canopy source directory
-		source_path = os.path.join(SRC_DIR, source['latest_download'])
-		# Skip local hydration during download-only runs
-		if settings.DOWNLOAD_ONLY: source['local_path'] = source_path
-		# Ensure source file exists locally even when canonical copy lives in S3
-		else: source['local_path'] = storage.ensure_local(source_path, SRC_DIR)
-	# If we haven't checked for the latest processed file yet	
+	# Resolve processed metadata before hydrating source contents so filename comparisons stay metadata-only
 	if not source.get('latest_processed'):
-		# Fetch the latest processed file
+		# Fetch the latest processed filename from the active storage backend
 		latest_processed = get_file(source['name'])
-		if latest_processed: 
+		# Record the processed version when one exists
+		if latest_processed:
 			source['latest_processed'] = latest_processed
 			source['timestamp_processed'] = int(latest_processed.split('.')[1])
 	# Check if we even have something to process at this point
 	# Use explicit None check so legacy datehash 0 files still count as available local sources
 	if source.get('timestamp_download') is None: return False
+	# Decide from versioned filenames whether source contents are needed by a processor
+	needs_processing = not source.get('timestamp_processed') or source.get('timestamp_processed') < source.get('timestamp_download')
+	# Prepare a local source path only when the run will consume source contents
+	if source.get('latest_download'):
+		# Build canonical source path under canopy source directory
+		source_path = os.path.join(SRC_DIR, source['latest_download'])
+		# Preserve download-only metadata without pulling canonical S3 contents back locally
+		if settings.DOWNLOAD_ONLY: source['local_path'] = source_path
+		# Hydrate source contents only for stale/missing processed data or explicit forced processing
+		elif settings.FORCE or needs_processing: source['local_path'] = storage.ensure_local(source_path, SRC_DIR)
 	# Persist latest known source metadata into shared state manifest
 	# Mark fetch stage only when this run actually downloaded a newer source file
 	if source.get('download_updated'): update_source_state(source, 'fetch')
 	# Otherwise update metadata only and keep the previous successful stage marker
 	else: update_source_state(source)
-	# Check if we need to process
-	if not source.get('timestamp_processed') or (source.get('timestamp_download') and source.get('timestamp_processed') < source.get('timestamp_download')):
+	# Report stale processed data after the metadata-only comparison
+	if needs_processing:
 		mesologger.info(f"Processed { source['name']} version outdated, we have { source.get('timestamp_processed') } but { source.get('timestamp_download') } is available.")
 		# Let importer know that processing needs to be done
 		return True
+	# Skip processing when the processed filename already matches the source version
 	return False
 
 # Collect latest processed parquet per dataset for fuse fallback runs

@@ -22,6 +22,8 @@ import aiohttp
 # File handling
 import zipfile
 from ..utils.filehandlers import fetch, get_file
+# Load storage helper so the combined processor can hydrate both required archives together
+from ..utils.s3 import storage
 
 # DB
 import duckdb
@@ -66,6 +68,13 @@ async def update_tropicos(session):
 
 # Process both Tropicos files
 def process_tropicos(sources: dict):
+	# Hydrate both companion archives when either source makes the combined output stale
+	for source in sources:
+		# Build the canonical source path for the active storage backend
+		source_path = f"{SRC_DIR}/{source['latest_download']}"
+		# Reuse an existing local file or download the required companion archive from S3
+		source['local_path'] = storage.ensure_local(source_path, SRC_DIR)
+	# Log both concrete source versions used by the combined processor
 	mesologger.info(f"Starting to process { sources[0]['latest_download'] } and { sources[1]['latest_download'] }...")  
 	# Load duckdb
 	with duckdb.connect(':memory:') as db:
