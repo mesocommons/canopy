@@ -17,7 +17,7 @@ from .utils.s3 import storage
 from .utils.state import set_checkpoint
 
 # Define source execution order so fusion gets expected dependencies
-sources = ['ipni', 'fungorum', 'wcvp', 'powo', 'wfo', 'col', 'tropicos', 'mycobank', 'bhl', 'gbif', 'wikidata', 'wikispecies', 'inaturalist', 'iucn', 'ncbi']
+sources = ['ipni', 'fungorum', 'wcvp', 'powo', 'wfo', 'col', 'colxr', 'tropicos', 'mycobank', 'bhl', 'gbif', 'wikidata', 'wikispecies', 'inaturalist', 'iucn', 'ncbi']
 
 # Run canopy stages based on CLI flags and return release metadata when available
 async def main(argv=None):

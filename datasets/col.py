@@ -42,7 +42,7 @@ from ..utils.filehandlers import fetch
 
 # DB
 import duckdb
-from ..utils.queries import publication_filter, name_cleanup, find_hybrids, build_rank_and_status, validate, write_to_disc, language_mappings
+from ..utils.queries import publication_filter, name_cleanup, find_hybrids, build_rank_and_status, validate, write_to_disc, coldp_vernacular
 
 # Import shared WGSRPD lookup mapping from canopy config schema
 from ..config.schema import WGSRPDLOOKUP
@@ -157,7 +157,7 @@ def process_col(source: dict):
 		""")
 		mesologger.info(f"Added {db.execute('SELECT COUNT(publication_short) FROM ' + source['name']).fetchone()[0]:,} publications to { source['name'] }")
 		# Add vernacular names from CoL VernacularName.tsv
-		col_vernacular(vernacular_tsv, db)
+		coldp_vernacular(vernacular_tsv, db, source)
 		find_hybrids(db,source)
 		# Generic cleanup
 		name_cleanup(db,source)
@@ -202,42 +202,6 @@ def external_col_ids(db: duckdb.DuckDBPyConnection, source: dict):
 	mesologger.info(f"""Added { db.execute(f"SELECT COUNT(*) FROM {source['name']} WHERE tropicos_id IS NOT NULL;").fetchone()[0] } Tropicos IDs to CoL""")
 	# All IDs extracted, drop the raw URL column to save parquet space
 	db.execute(f"""ALTER TABLE col DROP COLUMN link_raw;""")
-
-
-# Map CoL 3-letter language codes to 2-letter ISO and build lang:name vernacular array
-# VernacularName.tsv has 313 distinct languages, ~471k name rows for filtered plantae/fungi
-def col_vernacular(vernacular_tsv, db: duckdb.DuckDBPyConnection):
-	# Add vernacular column to col table
-	db.execute("ALTER TABLE col ADD COLUMN IF NOT EXISTS vernacular VARCHAR[]")
-	# Map 3-letter ISO codes to 2-letter via shared language_mappings, aggregate as lang:name pairs
-	db.execute(f"""
-		-- 3-letter to 2-letter ISO language mapping
-		WITH mapping_values AS (SELECT * FROM (VALUES {language_mappings}) AS t(lang3, lang2)),
-		names AS (
-			SELECT
-				v."col:taxonID" AS id_raw,
-				-- fall back to raw language code if no mapping exists (e.g. already 2-letter)
-				COALESCE(mv.lang2, v."col:language") AS iso_lang,
-				trim(lower(v."col:name")) AS name
-			FROM vernacular_tsv v
-			LEFT JOIN mapping_values mv ON lower(v."col:language") = mv.lang3
-			WHERE v."col:name" IS NOT NULL
-			AND length(trim(v."col:name")) > 0
-			-- only keep names for taxa in our filtered plantae/fungi set
-			AND EXISTS (SELECT 1 FROM col c WHERE c.id_raw = v."col:taxonID")
-		)
-		-- aggregate into lang:name array per taxon
-		UPDATE col c SET vernacular = sub.vern
-		FROM (
-			SELECT id_raw, array_agg(iso_lang || ':' || name) AS vern
-			FROM names WHERE iso_lang IS NOT NULL
-			GROUP BY id_raw
-		) sub
-		WHERE c.id_raw = sub.id_raw;
-	""")
-	# Log
-	count = db.execute("SELECT COUNT(*) FROM col WHERE vernacular IS NOT NULL AND len(vernacular) > 0").fetchone()[0]
-	mesologger.info(f"Added vernacular names to {count:,} CoL entries")
 
 
 # Build CoL text area lookup: 5 progressively aggressive normalization passes

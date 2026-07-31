@@ -185,7 +185,7 @@ def build_rank_and_status(db: duckdb.DuckDBPyConnection, source: dict):
 				-- Not checked
 				WHEN l.status_lower IN ('unchecked','unplaced','uncertain') THEN 'unplaced'
 				-- Def a synonym
-				WHEN l.status_lower IN ('synonym','heterotypic synonym','heterotypic_synonym','homotypic synonym','homotypic_synonym','proparte synonym') THEN 'synonym'
+				WHEN l.status_lower IN ('synonym','ambiguous synonym','heterotypic synonym','heterotypic_synonym','homotypic synonym','homotypic_synonym','proparte synonym') THEN 'synonym'
 				-- Or an issue
 				WHEN l.status_lower IN ('doubtful','illegitimate','invalid','orthographic','misapplied','orthographic variant','unavailable','deleted') THEN 'problematic'
 				ELSE NULL
@@ -268,6 +268,42 @@ def write_to_disc(db: duckdb.DuckDBPyConnection, source: dict, dir = PROCESSED_D
 		update_source_state(source, 'process')
 		# Delete older processed files
 		delete_older_files(filename.split('.')[0],filename.split('.')[1],PROCESSED_DIR)
+
+# Add normalized vernacular names from a ColDP VernacularName table
+def coldp_vernacular(vernacular_tsv, db: duckdb.DuckDBPyConnection, source: dict):
+	# Use the source name as the normalized table name
+	target = source['name']
+	# Add the standard canopy vernacular field
+	db.execute(f"ALTER TABLE {target} ADD COLUMN IF NOT EXISTS vernacular VARCHAR[]")
+	# Normalize language codes and aggregate names by usage
+	db.execute(f"""
+		WITH mapping_values AS (SELECT * FROM (VALUES {language_mappings}) AS t(lang3, lang2)),
+		names AS (
+			SELECT
+				v."col:taxonID" AS id_raw,
+				COALESCE(m.lang2, v."col:language") AS iso_lang,
+				trim(lower(v."col:name")) AS name
+			FROM vernacular_tsv v
+			LEFT JOIN mapping_values m ON lower(v."col:language") = m.lang3
+			WHERE v."col:name" IS NOT NULL
+				AND length(trim(v."col:name")) > 0
+				AND EXISTS (SELECT 1 FROM {target} t WHERE t.id_raw = v."col:taxonID")
+		),
+		aggregated AS (
+			SELECT id_raw, array_agg(iso_lang || ':' || name) AS values
+			FROM names
+			WHERE iso_lang IS NOT NULL
+			GROUP BY id_raw
+		)
+		UPDATE {target}
+		SET vernacular = aggregated.values
+		FROM aggregated
+		WHERE {target}.id_raw = aggregated.id_raw;
+	""")
+	# Report vernacular coverage for this source
+	count = db.execute(f"SELECT COUNT(*) FROM {target} WHERE vernacular IS NOT NULL AND len(vernacular) > 0").fetchone()[0]
+	# Log the number of usages with vernacular values
+	mesologger.info(f"Added vernacular names to {count:,} {target} entries")
 
 # Default way we map more exotic or 3 letter iso codes, including local dialects like Bavarian to German etc (Wikipedia)
 # Also reducing variants, eg en-gb becomes en and zh-hans becomes zh

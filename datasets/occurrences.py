@@ -52,51 +52,49 @@ async def update_occurrences():
 	if not storage.exists(file):
 		# Log bootstrap path
 		mesologger.info(f"No processed GBIF occurrence dataset found")
-		# Reuse already downloaded bootstrap zip only when it is valid
+		# Resolve the reusable bootstrap archive path
 		bootstrap_zip = os.path.join(TMP_DIR, 'occurrences.zip')
-		if os.path.isfile(bootstrap_zip):
-			# Ignore stale/corrupt bootstrap zips from interrupted downloads
-			if not is_valid_zip(bootstrap_zip):
-				mesologger.info('Existing occurrences.zip is invalid, deleting and re-downloading')
-				os.remove(bootstrap_zip)
-			# Otherwise process existing bootstrap zip into geoparquet
-			else:
-				distill_occurrences()
-				# Ensure manifest exists after local bootstrap processing
+		# Ignore stale or corrupt bootstrap archives from interrupted downloads
+		if os.path.isfile(bootstrap_zip) and not is_valid_zip(bootstrap_zip):
+			mesologger.info('Existing occurrences.zip is invalid, deleting and re-downloading')
+			os.remove(bootstrap_zip)
+		# Request a bootstrap archive only when no valid local copy remains
+		if not os.path.isfile(bootstrap_zip):
+			# Log API bootstrap request path
+			mesologger.info('Requesting initial GBIF occurrences export via API (plants and fungi only)')
+			# Get auth for entire session
+			auth = BasicAuth(settings.GBIF_USER, settings.GBIF_PASSWORD)
+			# Spawn async http session for bootstrap request polling and download
+			async with aiohttp.ClientSession(auth=auth, headers={"User-Agent": user_agent}) as session:
+				# Load or initialize occurrence manifest
 				manifest = get_manifest() or {}
-				manifest['initial_download'] = manifest.get('initial_download') or datetime.now(timezone.utc).isoformat()
-				save_manifest(manifest)
-				return
-		# Log API bootstrap request path
-		mesologger.info('Requesting initial GBIF occurrences export via API (plants and fungi only)')
-		# Get auth for entire session
-		auth = BasicAuth(settings.GBIF_USER, settings.GBIF_PASSWORD)
-		# Spawn async http session for bootstrap request polling and download
-		async with aiohttp.ClientSession(auth=auth, headers={"User-Agent": user_agent}) as session:
-			# Load or initialize occurrence manifest
-			manifest = get_manifest() or {}
-			# Request bootstrap export when there is no pending key yet
-			if not manifest.get('current_download_key'):
-				# Start a full initial export limited to required kingdoms and coordinate quality
-				await request_update_from_gbif(session, manifest, initial=True)
-			# Resolve the pending request key
-			pending_key = manifest.get('current_download_key')
-			# Hard-fail bootstrap if GBIF did not accept request creation
-			if not pending_key: raise RuntimeError('Initial GBIF occurrence export request failed')
-			# Resolve ready download URL for pending key
-			url = await get_gbif_download_url(session, manifest)
-			# Hard-fail bootstrap when export is still being prepared
-			if not url: raise RuntimeError('Initial GBIF occurrence export not ready yet please retry in 1 to 2 hours')
-			# Download pending initial export with readiness polling
-			success = await download_pending_occurrence_file(session, url, 'occurrences.zip', manifest)
-			# Hard-fail bootstrap when file is not ready/downloadable yet
-			if not success: raise RuntimeError('Initial GBIF occurrence export not ready yet please retry in 1 to 2 hours')
-		# Convert bootstrap zip into rolling geoparquet baseline
+				# Request bootstrap export when there is no pending key yet
+				if not manifest.get('current_download_key'):
+					# Start a full initial export limited to required kingdoms and coordinate quality
+					await request_update_from_gbif(session, manifest, initial=True)
+				# Resolve the pending request key
+				pending_key = manifest.get('current_download_key')
+				# Hard-fail bootstrap if GBIF did not accept request creation
+				if not pending_key: raise RuntimeError('Initial GBIF occurrence export request failed')
+				# Resolve ready download URL for pending key
+				url = await get_gbif_download_url(session, manifest)
+				# Hard-fail bootstrap when export is still being prepared
+				if not url: raise RuntimeError('Initial GBIF occurrence export not ready yet please retry in 1 to 2 hours')
+				# Download pending initial export with readiness polling
+				success = await download_pending_occurrence_file(session, url, 'occurrences.zip')
+				# Hard-fail bootstrap when file is not ready/downloadable yet
+				if not success: raise RuntimeError('Initial GBIF occurrence export not ready yet please retry in 1 to 2 hours')
+		# Convert the available bootstrap archive into the rolling geoparquet baseline
 		distill_occurrences()
-		# Persist bootstrap completion in manifest
+		# Load the manifest only after the rolling parquet was written durably
 		manifest = get_manifest() or {}
+		# Commit the export request time when available without advancing state before processing
+		manifest['latest_download'] = manifest.get('latest_download_request') or datetime.now(timezone.utc).isoformat()
+		# Preserve the existing initial-bootstrap completion timestamp behavior
 		manifest['initial_download'] = manifest.get('initial_download') or datetime.now(timezone.utc).isoformat()
-		manifest['last_processed_download_key'] = manifest.get('current_download_key')
+		# Mark the successfully persisted bootstrap archive complete
+		if manifest.get('current_download_key'): manifest['last_processed_download_key'] = manifest.get('current_download_key')
+		# Persist all successful bootstrap state together
 		save_manifest(manifest)
 		# Stop after successful bootstrap
 		return
@@ -140,7 +138,7 @@ async def get_latest_occurrences(file):
 			# Set a filename for pending incremental export
 			filename = f"occurrence_update.{ manifest.get('current_download_key') }.zip"
 			# Download with readiness checks (or reuse existing file)
-			success = await download_pending_occurrence_file(session, url, filename, manifest)
+			success = await download_pending_occurrence_file(session, url, filename)
 			# Soft-skip when file is still not ready
 			if not success:
 				mesologger.info('Incremental GBIF occurrence export file not ready yet, will retry in next run')
@@ -265,7 +263,7 @@ def is_valid_zip(path: str) -> bool:
 
 # Wait for GBIF file readiness and download with aria
 # Returns True when file exists and is valid, False when still not ready/failed
-async def download_pending_occurrence_file(session, url, filename, manifest):
+async def download_pending_occurrence_file(session, url, filename):
 	# Resolve local file path once
 	filepath = os.path.join(TMP_DIR, filename)
 	# Reuse previously downloaded file only if zip is valid
@@ -331,11 +329,7 @@ async def download_pending_occurrence_file(session, url, filename, manifest):
 	if success and not is_valid_zip(filepath):
 		mesologger.warning('Download completed but zip validation failed, will retry later')
 		return False
-	# Persist latest successful download timestamp
-	if success:
-		manifest['latest_download'] = datetime.now(timezone.utc).isoformat()
-		save_manifest(manifest)
-	# Return download outcome
+	# Return download outcome without advancing the processing watermark
 	return bool(success)
 
 # Shared extraction: iterate parquet chunks in GBIF zip, filter plantae/fungi with valid coords
@@ -366,16 +360,16 @@ def extract_from_zip(zip: zipfile.ZipFile, db: duckdb.DuckDBPyConnection):
 		if file.file_size == 0: continue
 		# Read file as Polars dataframe
 		df = pl.read_parquet(io.BytesIO(zip.read(file.filename)))
-		# Add rows
-		db.execute(f"""
+		# Add rows while parsing malformed taxonomy keys as NULL
+		db.execute("""
 			INSERT INTO occurrences BY NAME
-			SELECT 
+			SELECT
 				-- Unique occurrence ID
 				gbifid AS id,
-				-- Keep raw GBIF interpreted taxon key for deterministic post-extract synonym mapping
-				CAST(taxonkey AS UINTEGER) AS taxon_raw,
+				-- Keep raw numeric GBIF taxon key for deterministic post-extract synonym mapping
+				TRY_CAST(taxonkey AS UINTEGER) AS taxon_raw,
 				-- Seed canonical taxon from raw key, then overwrite only synonym rows
-				CAST(taxonkey AS UINTEGER) AS taxon,
+				TRY_CAST(taxonkey AS UINTEGER) AS taxon,
 				-- Fill synonym target key after extraction when raw key is a synonym
 				CAST(NULL AS UINTEGER) AS synonym_for,
 				-- 3 digits gives us about ~71m lon and ~111 meters lat, which is more than enough for 1-10km grids
@@ -385,7 +379,7 @@ def extract_from_zip(zip: zipfile.ZipFile, db: duckdb.DuckDBPyConnection):
 				-- Add entries with issues as fallback but we filter most in later distillation
 				list_contains(issue, 'HAS_GEOSPATIAL_ISSUE') AS spatial_issue
 			-- Filter for plants and fungi with valid coordinates, excluding 0/0 null island junk
-			FROM df WHERE kingdom IN ('Plantae','Fungi','Incertae sedis') 
+			FROM df WHERE kingdom IN ('Plantae','Fungi','Incertae sedis')
 			AND decimallatitude IS NOT NULL AND decimallongitude IS NOT NULL
 			AND NOT ST_Equals(ST_Point(decimallongitude, decimallatitude), ST_Point(0, 0));
 		""")
@@ -394,10 +388,12 @@ def extract_from_zip(zip: zipfile.ZipFile, db: duckdb.DuckDBPyConnection):
 		mesologger.info(f"Extracted {occurrence_count:,} occurrences from {counter} of {total} files", extra={'sameline': True})
 		# Iterate 
 		counter += 1
-	# Refresh final extracted count for accurate end-of-stage logging
-	occurrence_count = db.execute("SELECT COUNT(*) FROM occurrences").fetchone()[0]
+	# Refresh final row and unmatched-key counts in one scan for accurate logging
+	occurrence_count, unmatched_taxon_count = db.execute("SELECT COUNT(*), COUNT(*) FILTER (WHERE taxon IS NULL) FROM occurrences").fetchone()
 	# Print final extraction summary on the same carriage-return line as progress output
 	mesologger.info(f"Successfully extracted {occurrence_count:,} occurrences from {total} files".ljust(96), extra={'sameline': True})
+	# Report rows that downstream numeric taxonomy joins cannot match
+	if unmatched_taxon_count: mesologger.warning(f"Extracted {unmatched_taxon_count:,} occurrences with NULL or unparseable taxonkeys")
 	# Resolve synonyms to accepted GBIF keys once during ingest so geo stage can stay simple
 	resolve_occurrence_taxonkeys(db)
 	# Finish progress line with newline
@@ -524,8 +520,11 @@ def process_incremental_update(manifest,filename):
 			# Upload refreshed rolling occurrence parquet to S3 when backend is active
 			if storage.is_s3(): storage.upload(os.path.join(GEO_DIR, 'occurrences.parquet'))
 			mesologger.info(f"Wrote updated occurrences.parquet to {GEO_DIR}")
-		# Update manifest
-		manifest['last_processed_download_key'] =  manifest.get('current_download_key')
+		# Commit the export request time only after extraction and any rolling parquet upload succeeded
+		manifest['latest_download'] = manifest['latest_download_request']
+		# Mark the successfully persisted incremental archive complete
+		if manifest.get('current_download_key'): manifest['last_processed_download_key'] = manifest.get('current_download_key')
+		# Persist the safe request cutoff and processed key together
 		save_manifest(manifest)
 		mesologger.info(f"Updated manifest, occurrence update complete")
 

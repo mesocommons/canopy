@@ -48,6 +48,8 @@ From GBIF snapshot + incremental API downloads:
 - Initial bootstrap is very large (~200GB zipped parquet).
 - Incremental updates are asynchronous GBIF jobs and require readiness checks.
 - GBIF download readiness now uses size stabilization checks to avoid truncated successful downloads.
+- `taxonkey` is expected to be numeric. `TRY_CAST` retains NULL or unparseable keys as NULL numeric taxonomy fields, logs their count once, and never falls back to `speciesKey`; downstream numeric joins ignore them.
+- The incremental cutoff commits the export request timestamp only after extraction and rolling-parquet persistence complete successfully, including empty deltas.
 - Ingest filters out null-island points (`0,0`) early.
 
 ---
